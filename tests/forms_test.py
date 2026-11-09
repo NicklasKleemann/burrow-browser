@@ -2,7 +2,7 @@
 regressions: navigate on a page that never goes network-idle, and download sending set_browser_headers.
 Offline: serves its own pages from a local stdlib HTTP server."""
 import asyncio, http.server, json, os, sys, tempfile, threading, time
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server.py is one folder up
 import server
 
 APP = b"""<title>app</title><div class=spinner>loading</div>

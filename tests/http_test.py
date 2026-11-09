@@ -1,6 +1,6 @@
 """http_request: connection IP, Host header and SNI controlled independently."""
 import asyncio, os, socket, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server.py is one folder up
 import server
 
 

@@ -16,7 +16,7 @@ srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Refuse)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 os.environ["HTTPS_PROXY"] = f"http://127.0.0.1:{srv.server_address[1]}"
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server.py is one folder up
 import server
 
 async def main():

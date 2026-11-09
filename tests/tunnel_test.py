@@ -87,7 +87,7 @@ proxy = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Proxy)
 proxy.daemon_threads = True
 threading.Thread(target=proxy.serve_forever, daemon=True).start()
 os.environ["HTTPS_PROXY"] = f"http://agent:s3cret@127.0.0.1:{proxy.server_address[1]}"
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server.py is one folder up
 import server  # reads the proxy from the environment at import
 
 

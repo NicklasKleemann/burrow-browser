@@ -1,7 +1,7 @@
 """Two agents sharing one server: their sessions must not touch each other's page or cookies."""
 import asyncio, os, sys
 os.environ["BURROW_BROWSER_REQUIRE_SESSION"] = "1"
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server.py is one folder up
 import server
 
 

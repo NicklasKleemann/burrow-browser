@@ -2,7 +2,7 @@
 # dependencies = ["mcp>=1.0,<2", "camoufox[geoip]"]
 # ///
 import asyncio, json, os, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server.py is one folder up
 import server
 async def main():
     r = await server.navigate("https://example.com")

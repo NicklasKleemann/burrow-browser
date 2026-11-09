@@ -1,6 +1,6 @@
 """Crash the browser's content process, then check that burrow-browser recovers."""
 import asyncio, os, signal, subprocess, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server.py is one folder up
 import server
 
 

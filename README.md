@@ -131,10 +131,13 @@ Behind a proxy, `http_request` and `tls_audit` tunnel through it, so the Host he
 
 ## Tests
 
-Each `*_test.py` is a plain script; run it with the server's Python:
+The tests in `tests/` are plain Python scripts. Run them all:
 
 ```sh
-for t in *_test.py; do .venv/bin/python "$t" || echo "FAILED: $t"; done
+tests/run.sh             # all tests
+tests/run.sh --offline   # only the ones that need no internet
 ```
+
+`run.sh` uses `.venv/bin/python` if it exists; set `PYTHON` to use another interpreter. A single test runs on its own too: `.venv/bin/python tests/forms_test.py`.
 
 `forms_test`, `audit_test`, `security_test` and `tunnel_test` run against local servers they start themselves. `smoke_test`, `qa_test`, `session_test`, `http_test`, `crash_test` and `proxy_test` need internet access.

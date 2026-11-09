@@ -4,7 +4,7 @@
 """QA/diagnostics tools: get_response_body, cookies, console_logs, frames_and_listeners,
 websockets, set_browser_headers, and the extended http_request."""
 import asyncio, os, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server.py is one folder up
 import server
 
 

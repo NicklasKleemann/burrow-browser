@@ -1,7 +1,7 @@
 """snapshot, tabs (popups), route (mocks/failures/delays), security_headers, close_session.
 Offline: serves its own pages from a local stdlib HTTP server."""
 import asyncio, http.server, json, os, sys, tempfile, threading, time
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server.py is one folder up
 import server
 
 HOME = b"""<title>home</title><h1>Orders</h1><button>Save</button><button></button>

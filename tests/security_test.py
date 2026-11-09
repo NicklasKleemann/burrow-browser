@@ -2,7 +2,7 @@
 Offline: a local HTTP server with deliberately bad behaviour, and a local TLS server with a
 self-signed, soon-expiring certificate."""
 import asyncio, datetime, http.server, os, ssl, sys, tempfile, threading
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server.py is one folder up
 import server
 
 APP_JS = b"""const cfg = {region: "eu", apiKey: "abcd1234efgh5678", db: "db1.corp", host: "10.1.2.3"};
