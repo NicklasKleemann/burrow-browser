@@ -36,6 +36,49 @@ K = {k: gen(k) for k in ("apikey", "hex", "short", "bearer", "netaxept", "stripe
 XAPIKEY = gen("hex")  # distinct draws: found{} dedups by value, so a shared value would hide a name
 MAC = gen("hex")
 
+
+def rc(alpha, n):
+    return "".join(random.choice(alpha) for _ in range(n))
+
+
+_U, _L, _D = string.ascii_uppercase, string.ascii_lowercase, string.digits
+_AL, _HEX = string.ascii_letters + _D, "0123456789abcdef"
+# One valid random sample per provider pattern, keyed by the kind scan_secrets should label it.
+# Each is scanned as raw page text (quotes/&/= intact), so patterns needing surrounding punctuation
+# (AccountKey=, "Bearer …", sv=…sig=, user:pass@, ?token=) match as written. No literal is a real key.
+COVER = {
+    "private_key":            "-----BEGIN PRIVATE KEY-----",
+    "aws_access_key":         "AKIA" + rc(_U + _D, 16),
+    "azure_storage_key":      "AccountKey=" + rc(_AL + "+/", 44),
+    "stripe_secret_key":      "sk_live_" + rc(_AL, 24),
+    "github_token":           "ghp_" + rc(_AL + _D, 36),
+    "gitlab_token":           "glpat-" + rc(_AL + "-_", 20),
+    "npm_token":              "npm_" + rc(_AL + _D, 36),
+    "shopify_token":          "shpat_" + rc(_HEX, 32),
+    "sendgrid_key":           "SG." + rc(_AL + "-_", 22) + "." + rc(_AL + "-_", 40),
+    "twilio_api_key":         "SK" + rc(_HEX, 32),
+    "huggingface_token":      "hf_" + rc(_AL, 32),
+    "slack_token":            "xoxb-" + rc(_AL + "-", 20),
+    "slack_webhook":          "https://hooks.slack.com/services/T" + rc(_U + _D, 8) + "/B" + rc(_U + _D, 8) + "/" + rc(_AL, 24),
+    "google_oauth_secret":    "GOCSPX-" + rc(_AL + "-_", 24),
+    "mapbox_secret_token":    "sk.eyJ" + rc(_AL + "-", 12) + "." + rc(_AL + "-", 12),
+    "ai_api_key":             "sk-ant-" + rc(_AL + "_-", 40),
+    "url_credentials":        "https://admin:" + rc(_AL, 16) + "@internal.example.test",
+    "auth_header_literal":    '"Bearer ' + rc(_AL + "._-", 32) + '"',
+    "azure_sas_token":        "sv=2021-08-06&ss=b&srt=co&sp=r&sig=" + rc(_AL + "%+/", 24) + "=",
+    "jwt":                    "eyJ" + rc(_AL + "-_", 20) + ".eyJ" + rc(_AL + "-_", 20) + "." + rc(_AL + "-_", 20),
+    "twilio_account_sid":     "AC" + rc(_HEX, 32),
+    "google_api_key":         "AIza" + rc(_AL + "-_", 35),
+    "sentry_dsn":             "https://" + rc(_HEX, 32) + "@o1.ingest.sentry.io/1",
+    "mapbox_public_token":    "pk.eyJ" + rc(_AL + "-", 12) + "." + rc(_AL + "-", 12),
+    "datadog_client_token":   "pub" + rc(_HEX, 32),
+    "stripe_publishable_key": "pk_live_" + rc(_AL, 24),
+    "app_insights_key":       "InstrumentationKey=" + gen("guid"),
+    "credential_in_url":      "https://api.example.test/x?access_token=" + rc(_AL + "-_", 24),
+    "internal_host":          "http://10.3.14.159/admin",
+}
+COVER_TEXT = "\n".join(COVER.values())
+
 NESTED = json.dumps({"content": json.dumps({"netaxeptToken": K["netaxept"]})})
 PAGE = """<!doctype html><title>fix</title><body><div data-api-key="%(short)s">x</div>
 <script>
@@ -52,7 +95,8 @@ function go(){ this.http.post(checkoutUrl, {}); fetch("/AgeVerification/Validate
 try { localStorage.setItem("authToken", "Bearer %(bearer)s"); } catch(e){}
 try { sessionStorage.setItem("LJ.PaymentData", JSON.stringify({mac: "%(mac)s"})); } catch(e){}
 fetch("/api/data", {method: "POST", headers: {"X-Api-Key": "%(xapikey)s"}, body: JSON.stringify({q: "x"})});
-</script></body>""" % {**K, "xapikey": XAPIKEY, "mac": MAC}
+</script>
+<pre id="cover">%(cover)s</pre></body>""" % {**K, "xapikey": XAPIKEY, "mac": MAC, "cover": COVER_TEXT}
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -83,6 +127,10 @@ async def main():
     want("X-Api-Key", "outgoing request header")
     want("netaxeptToken", "double-serialized JSON response field")
     want("mac", "secret in sessionStorage JSON blob")
+    # every provider pattern still classifies a valid sample under its own kind (regex-regression guard)
+    kinds = {f["kind"] for f in r["findings"]}
+    missing = [k for k in COVER if k not in kinds]
+    assert not missing, f"provider patterns not detected: {missing}\ndetected kinds: {sorted(kinds)}"
     # private key must be high severity
     priv = next(f for f in r["findings"] if f.get("name", "").endswith("clerkIOPrivateApiKey"))
     assert priv["severity"] == "high", priv
