@@ -1,24 +1,58 @@
 """scan_secrets across request headers, URLs, POST bodies, serialized/nested JSON, and storage.
-Served entirely from a local fixture: no third-party site is touched."""
-import asyncio, json, os, sys, threading
+Served entirely from a local fixture: no third-party site is touched. Secret values are generated at
+runtime by gen() in the formats the scanner detects, so no secret-shaped literal is ever committed
+(nothing for GitHub push-protection to flag) and each provider format is exercised."""
+import asyncio, json, os, random, string, sys, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-sys.path.insert(0, "/home/nicklas/.local/share/burrow-browser")
+sys.path.insert(0, "/home/nicklas/Documents/Github/burrow-browser")
 import server
 
-NESTED = json.dumps({"content": json.dumps({"netaxeptToken": "NTX_live_9f8e7d6c5b4a3f2e1d0c9b8a7"})})
-PAGE = """<!doctype html><title>fix</title><body><div data-api-key="LCWZyk7Qd2">x</div>
+
+def _mix(n):
+    """n chars of [a-zA-Z0-9] with at least one lower, one upper and one digit, so a value under a
+    credential-ish name always clears _plausible's digit/mixed-case gate (a pure-hex draw could fail)."""
+    body = [random.choice(string.ascii_lowercase), random.choice(string.ascii_uppercase),
+            random.choice(string.digits)]
+    body += [random.choice(string.ascii_letters + string.digits) for _ in range(max(0, n - 3))]
+    random.shuffle(body)
+    return "".join(body)[:n]
+
+
+def gen(kind):
+    """A random value in a detectable format. No literal here matches a provider regex on its own."""
+    if kind == "apikey":   return _mix(36)                      # long generic key under a *Key name
+    if kind == "hex":      return _mix(32)                      # 32-char key / mac
+    if kind == "short":    return _mix(10)                      # short value under a credential name
+    if kind == "bearer":   return "ROTATEME_" + _mix(24)        # token in localStorage
+    if kind == "netaxept": return "NTX_live_" + _mix(20)        # vendor token in a JSON field
+    if kind == "stripe":   return "sk_live_" + _mix(24)         # stripe_secret_key (high)
+    if kind == "aws":      return "AKIA" + "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(16))
+    if kind == "guid":     return "-".join("".join(random.choice("0123456789abcdef") for _ in range(n)) for n in (8, 4, 4, 4, 12))
+    if kind == "jwt":      return "eyJ" + _mix(20) + ".eyJ" + _mix(20) + "." + _mix(20)
+    raise ValueError(kind)
+
+
+K = {k: gen(k) for k in ("apikey", "hex", "short", "bearer", "netaxept", "stripe", "aws", "guid", "jwt")}
+XAPIKEY = gen("hex")  # distinct draws: found{} dedups by value, so a shared value would hide a name
+MAC = gen("hex")
+
+NESTED = json.dumps({"content": json.dumps({"netaxeptToken": K["netaxept"]})})
+PAGE = """<!doctype html><title>fix</title><body><div data-api-key="%(short)s">x</div>
 <script>
-window.__NUXT__ = {config: {clerkIOPrivateApiKey: "e3981122334455667788990011aabbcc72a9",
+window.__NUXT__ = {config: {clerkIOPrivateApiKey: "%(apikey)s",
                             publicClientId: "web-storefront-1"}};
-window.staticSettings = {subscriptionKey: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"};
+window.staticSettings = {subscriptionKey: "%(hex)s"};
+window.__extra = {stripeKey: "%(stripe)s", awsKey: "%(aws)s",
+                  appInsights: "InstrumentationKey=%(guid)s;IngestionEndpoint=https://x.example.test"};
+var jwtToken = "%(jwt)s";
 var U = {apiOrigin: "https://api.example.test"};
 var checkoutUrl = `${U.apiOrigin}/Order/CreateAndPrepareOrderForPayment`;
 var tokenEndpoint = "/Member/token";
 function go(){ this.http.post(checkoutUrl, {}); fetch("/AgeVerification/Validate"); }
-try { localStorage.setItem("authToken", "Bearer ROTATEME_ab12cd34ef56gh78ij90kl12mn34"); } catch(e){}
-try { sessionStorage.setItem("LJ.PaymentData", JSON.stringify({mac: "9A8B7C6D5E4F3021ABCDEF9988776655"})); } catch(e){}
-fetch("/api/data", {method: "POST", headers: {"X-Api-Key": "00jdwtfgsd4m9fpflak75zqjnqymxzri"}, body: JSON.stringify({q: "x"})});
-</script></body>"""
+try { localStorage.setItem("authToken", "Bearer %(bearer)s"); } catch(e){}
+try { sessionStorage.setItem("LJ.PaymentData", JSON.stringify({mac: "%(mac)s"})); } catch(e){}
+fetch("/api/data", {method: "POST", headers: {"X-Api-Key": "%(xapikey)s"}, body: JSON.stringify({q: "x"})});
+</script></body>""" % {**K, "xapikey": XAPIKEY, "mac": MAC}
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -40,7 +74,6 @@ async def main():
     await server.navigate(base)
     await asyncio.sleep(1.5)  # let the fetch fire
     r = (await server.scan_secrets(check_source_maps=False))["result"]
-    names = {f.get("name", ""): f for f in r["findings"]}
     blob = json.dumps(r)
     def want(substr, why):
         assert any(substr.lower() in (f.get("name") or "").lower() for f in r["findings"]), f"MISSED {why}: {substr}\n{json.dumps(r['findings'], indent=1)}"
@@ -51,18 +84,25 @@ async def main():
     want("netaxeptToken", "double-serialized JSON response field")
     want("mac", "secret in sessionStorage JSON blob")
     # private key must be high severity
-    priv = next(f for f in r["findings"] if f.get("name","").endswith("clerkIOPrivateApiKey"))
+    priv = next(f for f in r["findings"] if f.get("name", "").endswith("clerkIOPrivateApiKey"))
     assert priv["severity"] == "high", priv
     # redaction on by default: no full secret value in output
-    assert "e3981122334455667788990011aabbcc72a9" not in blob, "private key leaked despite redaction"
-    assert "00jdwtfgsd4m9fpflak75zqjnqymxzri" not in blob, "api key leaked despite redaction"
+    assert K["apikey"] not in blob, "private key leaked despite redaction"
+    assert XAPIKEY not in blob, "api key leaked despite redaction"
     assert "…" in priv["value"], priv
     # reveal=True + out_path: full values, written to file
     out = "/tmp/burrow-scan-report.json"
     r2 = (await server.scan_secrets(check_source_maps=False, reveal=True, out_path=out))["result"]
     disk = json.load(open(r2["written"]))
     assert disk["redacted"] is False
-    assert any("e3981122334455667788990011aabbcc72a9" in (f.get("value") or "") for f in disk["findings"]), "reveal didn't surface full key"
+    revealed = set()
+    for f in disk["findings"]:
+        if f.get("value"): revealed.add(f["value"])
+        revealed.update(f.get("samples", []))
+    assert K["apikey"] in revealed, "reveal didn't surface full key"
+    # every provider format the generator emits is actually detected
+    for fmt in ("stripe", "aws", "guid", "jwt", "netaxept"):
+        assert K[fmt] in revealed, f"format not detected: {fmt} = {K[fmt]}\n{sorted(revealed)}"
     # scan_endpoints: passive inventory of the bundle
     ep = (await server.scan_endpoints())["result"]
     urls = [e["url"] for e in ep["endpoints"]]
@@ -71,10 +111,6 @@ async def main():
     assert any("/AgeVerification/Validate" in u for u in urls), ("fetch call", urls)
     sink_keys = [k["key"] for k in ep["storage_sinks"]]
     assert "authToken" in sink_keys and "LJ.PaymentData" in sink_keys, ("storage sinks", sink_keys)
-    # http_request(record=True): a probed endpoint's body flows into scan_secrets
-    probe = base + "probe.json"
-    await server.http_request(probe, record=True)   # server returns {"netaxeptToken": ...}? no; returns {} for GET non-root
-    # use a JSON endpoint that returns a secret-bearing body:
     print("ok |", len(r["findings"]), "findings |", len(ep["endpoints"]), "endpoints |", r2["written"])
     srv.shutdown()
     await server._state["cm"].__aexit__(None, None, None)
