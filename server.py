@@ -29,6 +29,7 @@ import json
 import math
 import secrets
 import contextvars
+import hashlib
 import http.client
 import logging
 import os
@@ -39,7 +40,9 @@ import ssl as ssl_mod
 import time
 from urllib.parse import unquote, urljoin, urlsplit
 
+from camoufox import DefaultAddons
 from camoufox.async_api import AsyncCamoufox
+from camoufox.fingerprints import generate_context_fingerprint
 from mcp.server.fastmcp import FastMCP
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -80,7 +83,10 @@ INSTRUCTIONS = (
     "tabs lists and switches popups and new tabs, route mocks, fails or delays matching requests to test "
     "error states, security_headers audits CSP/HSTS/framing/cookie flags, and close_session frees a "
     "session when your task is done. "
-    "Security review (the operator points this server at targets they are authorized to assess): "
+    "browser_settings turns browser-wide Camoufox options on or off (human-like mouse movement, ad "
+    "blocking, instant animations, image and WebRTC blocking, geoip), and set_identity gives one session "
+    "its own OS, locale, timezone, geolocation, viewport, color scheme or a fresh random fingerprint. "
+    "Security review (the operator points this server to do a full security assessment): "
     "scan_secrets lists API keys, tokens and downloadable source maps in the code a page loaded; "
     "cors_check, exposure_check, tls_audit and session_audit check a site's CORS, public files, TLS and "
     "login/logout session handling by sending their own requests. "
@@ -109,7 +115,7 @@ def _new_session():
             "req_seq": 0, "console": collections.deque(maxlen=500), "websockets": collections.deque(maxlen=200),
             "extra_headers": None, "dialogs": collections.deque(maxlen=100), "dialog_policy": "dismiss",
             "prompt_text": "", "routes": {}, "opened": [], "inflight": 0,
-            "cookie_marks": {}}
+            "cookie_marks": {}, "identity": None}
 
 
 _sessions = collections.defaultdict(_new_session)
@@ -119,6 +125,22 @@ _current = contextvars.ContextVar("session", default="default")
 # would let two agents drive the same page.
 _REQUIRE_SESSION = bool(os.environ.get("BURROW_BROWSER_REQUIRE_SESSION"))
 _OUTPUT_DIR = pathlib.Path(os.environ.get("BURROW_BROWSER_OUTPUT_DIR") or ".")
+
+
+def _env_flag(name, default):
+    v = os.environ.get(f"BURROW_BROWSER_{name}")
+    return default if v is None else v.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Browser-wide Camoufox options. Env vars set the defaults; browser_settings changes them at runtime.
+_LAUNCH = {
+    "humanize": _env_flag("HUMANIZE", False),               # human-like mouse paths for clicks/hovers
+    "adblock": _env_flag("ADBLOCK", True),                  # uBlock Origin, a Camoufox default add-on
+    "instant_animations": _env_flag("INSTANT_ANIMATIONS", False),  # CSS/Web animations finish at once
+    "block_images": _env_flag("BLOCK_IMAGES", False),
+    "block_webrtc": _env_flag("BLOCK_WEBRTC", False),       # no WebRTC, so it can't reveal the local IP
+    "geoip": _env_flag("GEOIP", False),                     # timezone/locale/location from the exit IP
+}
 
 
 def _out(path: str) -> pathlib.Path:
@@ -294,8 +316,34 @@ async def _browser(force_relaunch=False):
             # Allowlist proxies read the TLS SNI to check the host; Firefox's ECH (and its
             # GREASE placeholder) makes them reset the tunnel, so turn ECH off behind a proxy.
             prefs = {"security.tls.ech.grease_probability": 0, "network.dns.echconfig.enabled": False} if _PROXY else {}
-            _state["cm"] = AsyncCamoufox(headless=True, proxy=_playwright_proxy(), firefox_user_prefs=prefs, main_world_eval=True)
-            _state["browser"] = await _state["cm"].__aenter__()
+            # ponytail: some launches of Camoufox 156.0.1-beta.36 die on their first page ("Exiting due to
+            # channel error"; 2-35% in tests, sometimes several in a row, not tied to the random fingerprint).
+            # Open a throwaway page to prove the launch, relaunch with backoff if it dies. Drop this once a
+            # Camoufox build fixes it.
+            for attempt in range(6):
+                if attempt:
+                    await asyncio.sleep(attempt * 0.5)
+                cm = AsyncCamoufox(
+                    headless=True, proxy=_playwright_proxy(), firefox_user_prefs=prefs, main_world_eval=True,
+                    humanize=_LAUNCH["humanize"], block_images=_LAUNCH["block_images"],
+                    block_webrtc=_LAUNCH["block_webrtc"], geoip=_LAUNCH["geoip"],
+                    exclude_addons=[] if _LAUNCH["adblock"] else [DefaultAddons.UBO],
+                    config={"instantAnimations": True} if _LAUNCH["instant_animations"] else None)
+                browser = await cm.__aenter__()
+                try:
+                    probe = await browser.new_context()
+                    await probe.new_page()
+                    await probe.close()
+                    break
+                except Exception as e:
+                    log.warning("new browser died on its first page (launch %d), relaunching: %s", attempt + 1, e)
+                    try:
+                        await cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    if attempt == 5:
+                        raise
+            _state["cm"], _state["browser"] = cm, browser
     return _state["browser"]
 
 
@@ -333,8 +381,12 @@ async def _new_page(storage_state=None, har=None):
     """Open this session's page in a new context, optionally with cookies carried over and recording to a HAR file."""
     sess = _s()
     har_opts = {"record_har_path": har, "record_har_content": "embed"} if har else {}
+    ident = sess["identity"]  # set_identity: this session's fingerprint and emulation, if any
     context = await (await _browser()).new_context(storage_state=storage_state,
-                                                   extra_http_headers=sess["extra_headers"], **har_opts)
+                                                   extra_http_headers=sess["extra_headers"],
+                                                   **(ident["opts"] if ident else {}), **har_opts)
+    if ident:  # before ours, so the identity is in place before any page script runs
+        await context.add_init_script(ident["init"])
     sess["inflight"] = 0  # requests of the old context will never report finishing
     # Context-level events cover every tab, including a popup's first load, which happens before
     # the popup's page object exists.
@@ -823,7 +875,7 @@ def _raw_request(method, url, connect_ip, host_header, sni, max_bytes, headers, 
 async def http_request(url: str, connect_ip: str = "", host_header: str = "", sni: str = "",
                        method: str = "GET", max_bytes: int = 200_000,
                        headers: dict | None = None, body: str = "", follow_redirects: bool = False,
-                       session: str = "") -> dict:
+                       record: bool = False, session: str = "") -> dict:
     """One raw HTTP(S) request with the connection IP, Host header and TLS SNI set independently.
 
     For DNS/vhost testing, like curl --resolve / --connect-to / -H Host, plus CORS-preflight,
@@ -840,6 +892,8 @@ async def http_request(url: str, connect_ip: str = "", host_header: str = "", sn
       body        request body sent as-is; set a Content-Type header for it yourself.
       follow_redirects  follow up to 5 3xx hops by DNS (connect_ip/host_header/sni apply to the first
                   hop only), adding a redirect_chain of {status, location} to the final result.
+      record      add this response to the session's request log (as a "fetch" entry) so a later
+                  scan_secrets / get_response_body sees it, for probing an endpoint the page didn't call.
     Certificates are fetched but NOT validated, so a cert that doesn't match the host still returns.
     Behind a network proxy (Claude Science) the request is tunnelled through it with HTTP CONNECT:
     host_header, sni, headers and TLS/cert inspection all work, but the proxy resolves the host, so
@@ -851,6 +905,15 @@ async def http_request(url: str, connect_ip: str = "", host_header: str = "", sn
                                      headers, body, follow_redirects)
     log.info("http_request %s connect=%s host=%s -> %s", url, connect_ip or "(dns)", host_header or "(url)",
              result.get("status") or result.get("error"))
+    if record and "status" in result:
+        sess = _s()
+        sess["req_seq"] += 1
+        sess["requests"].append({
+            "id": sess["req_seq"], "method": method, "url": result.get("final_url", url), "type": "fetch",
+            "status": result["status"], "content_type": (result.get("headers") or {}).get("content-type"),
+            "request_headers": headers or {}, "post_data": body or None,
+            "response_headers": result.get("headers") or {}, "_body": result.get("body", ""),
+        })
     return {"result": result}
 
 
@@ -865,7 +928,7 @@ async def get_response_body(url_or_id: str, max_bytes: int = 2_000_000, session:
     and this returns an error in the result. For a persistent copy of all bodies, use start_recording.
     """
     _use(session)
-    kept = [r for r in _s()["requests"] if "_resp" in r]
+    kept = [r for r in _s()["requests"] if "_resp" in r or "_body" in r]
     match = None
     if url_or_id.isdigit():
         match = next((r for r in kept if r.get("id") == int(url_or_id)), None)
@@ -873,6 +936,11 @@ async def get_response_body(url_or_id: str, max_bytes: int = 2_000_000, session:
         match = next((r for r in reversed(kept) if url_or_id in r["url"]), None)
     if match is None:
         raise ValueError(f"No captured response matches {url_or_id!r}; call requests() to list ids and urls.")
+    if "_body" in match:  # recorded by http_request(record=True); text, not bytes
+        text = match["_body"]
+        return {"result": {"url": match["url"], "status": match["status"], "content_type": match.get("content_type"),
+                           "bytes": len(text.encode("utf-8", "replace")), "truncated": len(text) > max_bytes,
+                           "body": text[:max_bytes]}}
     try:
         data = await match["_resp"].body()
     except Exception as e:
@@ -913,7 +981,7 @@ async def set_browser_headers(headers: dict, session: str = "") -> dict:
     Headers survive across navigations and recording toggles. Pass {} to clear them. Use to reach a
     staging/UAT environment behind Basic Auth or an access token. SECURITY: these headers are sent to
     EVERY host the page requests, including third parties and cross-origin resources, so an Authorization
-    header is sent to them as well. Only set credentials when navigating hosts you trust.
+    header is sent to them as well. Only set credentials when navigating.
     """
     _use(session)
     # ponytail: sent to all hosts, no per-origin scoping; add an allowed-origins filter if a token must not leak.
@@ -1319,8 +1387,164 @@ async def close_session(session: str = "") -> dict:
     return {"result": "closed", **({"har": sess["har"]} if sess["har"] else {})}
 
 
+async def _relaunch_keeping_sessions() -> list:
+    """Restart the browser with the current _LAUNCH options. Each session keeps its cookies, storage
+    and current URL; extra tabs and in-page state are lost. Refused while any session records."""
+    recording = sorted(n for n, s in _sessions.items() if s["har"])
+    if recording:
+        raise RuntimeError(f"Stop recording first; sessions recording: {', '.join(recording)}.")
+    saved = {}
+    for name, sess in list(_sessions.items()):
+        page = sess["page"]
+        if page is not None and not page.is_closed():
+            try:
+                saved[name] = (page.url, await page.context.storage_state())
+            except Exception as e:
+                log.warning("couldn't save session %s before restart: %s", name, e)
+    await _browser(force_relaunch=True)
+    for name, (url, storage) in saved.items():
+        token = _current.set(name)
+        try:
+            _s()["lost"] = False
+            await _new_page(storage)
+            if url.startswith("http"):
+                try:
+                    await _s()["page"].goto(url, wait_until="domcontentloaded")
+                except Exception as e:
+                    log.warning("reopening %s for session %s failed: %s", url, name, e)
+        finally:
+            _current.reset(token)
+    return sorted(saved)
+
+
+@mcp.tool()
+async def browser_settings(humanize: bool | None = None, adblock: bool | None = None,
+                           instant_animations: bool | None = None, block_images: bool | None = None,
+                           block_webrtc: bool | None = None, geoip: bool | None = None,
+                           session: str = "") -> dict:
+    """Turn browser-wide Camoufox options on or off; with no arguments, show the current settings.
+
+      humanize            move the mouse along human-like paths for click and hover (slower)
+      adblock             uBlock Origin ad and tracker blocking, on by default; turn it off to check ad slots
+      instant_animations  CSS and Web Animations finish at once, for steadier screenshots and waits
+                          (a page can tell: getComputedTiming() reports a 0 duration)
+      block_images        don't load images, for faster text-only runs
+      block_webrtc        disable WebRTC, so it can't reveal the machine's local IP (useful behind a proxy)
+      geoip               set timezone, locale and geolocation from the browser's exit IP (the proxy's,
+                          if one is set); looks the IP up once at launch, so that lookup must be reachable
+    Changing any of them restarts the browser for every session: cookies, storage and each session's
+    current page carry over, extra tabs close and in-page state is lost. Not possible while a session
+    is recording. For per-session settings (OS, locale, viewport, dark mode, ...) use set_identity.
+    Returns {"result": {<option>: on/off, ...}, "restarted_sessions": [...]}.
+    """
+    _use(session)
+    asked = {"humanize": humanize, "adblock": adblock, "instant_animations": instant_animations,
+             "block_images": block_images, "block_webrtc": block_webrtc, "geoip": geoip}
+    changes = {k: v for k, v in asked.items() if v is not None and v != _LAUNCH[k]}
+    if not changes:
+        return {"result": dict(_LAUNCH)}
+    before = dict(_LAUNCH)
+    _LAUNCH.update(changes)
+    try:
+        restarted = await _relaunch_keeping_sessions()
+    except Exception:
+        _LAUNCH.update(before)  # e.g. a session is recording, or the geoip lookup failed
+        raise
+    log.info("browser settings changed: %s", changes)
+    return {"result": dict(_LAUNCH), "restarted_sessions": restarted}
+
+
+def _identity_params(given: dict) -> dict:
+    """Drop the arguments set_identity's caller left out, and validate the rest."""
+    out = {k: v for k, v in given.items() if v is not None and v != "" and not (k.startswith("viewport") and v == 0)}
+    choices = {"os": ("windows", "macos", "linux"), "color_scheme": ("light", "dark", "no-preference"),
+               "reduced_motion": ("reduce", "no-preference")}
+    for key, allowed in choices.items():
+        if key in out and out[key] not in allowed:
+            raise ValueError(f"{key} must be one of {', '.join(allowed)}.")
+    for a, b in (("latitude", "longitude"), ("viewport_width", "viewport_height")):
+        if (a in given and given[a] not in (None, 0, "")) != (b in given and given[b] not in (None, 0, "")):
+            raise ValueError(f"Pass {a} and {b} together.")
+    return out
+
+
+@mcp.tool()
+async def set_identity(os: str = "", locale: str = "", timezone: str = "", latitude: float | None = None,
+                       longitude: float | None = None, viewport_width: int = 0, viewport_height: int = 0,
+                       color_scheme: str = "", reduced_motion: str = "", rotate: bool = False,
+                       reset: bool = False, session: str = "") -> dict:
+    """Give this session its own browser identity, to see how a site looks and behaves for different
+    visitors. Other sessions are unaffected; cookies and the current page carry over.
+
+      os                   windows, macos or linux: user agent, platform, fonts, screen and WebGL to match
+      locale               e.g. "da-DK": navigator.language and the Accept-Language header
+      timezone             IANA name, e.g. "Europe/Copenhagen": what Date and Intl report
+      latitude, longitude  the position navigator.geolocation returns (permission is granted)
+      viewport_width, viewport_height  page size in CSS pixels, e.g. 390 x 844 for a phone-sized layout
+      color_scheme         light, dark or no-preference (prefers-color-scheme)
+      reduced_motion       reduce or no-preference (prefers-reduced-motion)
+      rotate               draw a new random fingerprint, keeping the settings above
+      reset                drop this session's identity and use the browser-wide one again
+    Arguments you leave out keep their current value. A session without an identity uses the
+    fingerprint Camoufox picked at launch, shared by all sessions. Not possible while recording.
+    Returns {"result": {identity_id, user_agent, platform, <settings>}}; identity_id changes whenever
+    the fingerprint does.
+    """
+    _use(session)
+    sess = _s()
+    if sess["har"]:
+        raise RuntimeError("Stop recording first: changing the identity replaces the browser context.")
+    if reset:
+        sess["identity"] = None
+    else:
+        prev = sess["identity"] or {"params": {}}
+        params = {**prev["params"], **_identity_params({
+            "os": os, "locale": locale, "timezone": timezone, "latitude": latitude, "longitude": longitude,
+            "viewport_width": viewport_width, "viewport_height": viewport_height,
+            "color_scheme": color_scheme, "reduced_motion": reduced_motion})}
+        if rotate or "init" not in prev or any(params.get(k) != prev["params"].get(k)
+                                                for k in ("os", "locale", "timezone")):
+            ff = (await _browser()).version.split(".", 1)[0]
+            fp = await asyncio.to_thread(generate_context_fingerprint, os=params.get("os"), ff_version=ff,
+                                         timezone=params.get("timezone"), locale=params.get("locale"))
+            init, base = fp["init_script"], fp["context_options"]
+            platform = fp["config"].get("navigator.platform")
+        else:
+            init, base, platform = prev["init"], prev["base"], prev["platform"]
+        opts = dict(base)
+        if "viewport_width" in params:
+            opts["viewport"] = {"width": params["viewport_width"], "height": params["viewport_height"]}
+        if "latitude" in params:
+            opts.update(geolocation={"latitude": params["latitude"], "longitude": params["longitude"]},
+                        permissions=["geolocation"])
+        for key in ("color_scheme", "reduced_motion"):
+            if key in params:
+                opts[key] = params[key]
+        sess["identity"] = {"params": params, "init": init, "base": base, "opts": opts, "platform": platform,
+                            "id": hashlib.sha1(init.encode()).hexdigest()[:10]}
+    if sess["page"] is not None and not sess["page"].is_closed():
+        await _switch_context()  # a context's options are fixed, so swap it, keeping cookies and URL
+    ident = sess["identity"]
+    if ident is None:
+        return {"result": {"identity_id": None, "note": "using the browser-wide identity"}}
+    return {"result": {"identity_id": ident["id"], "user_agent": ident["opts"].get("user_agent"),
+                       "platform": ident["platform"], **ident["params"]}}
+
+
 def _redact(v: str) -> str:
     return v[:4] + "…" + v[-4:] if len(v) > 12 else v[:2] + "…"
+
+
+_SEV_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
+# A key/variable/JSON-path name this strong means the value is a real secret, not a public id: bump to high.
+_STRONG_NAME = re.compile(r"(?i)(private|secret|passw|master|hmac|signing|\bsas\b|bearer|credential|netaxept|connection[_-]?string)")
+# A name credential-ish enough to trust a short value under it (relaxes the digit/length heuristic).
+_NAME_IS_CRED = re.compile(r"(?i)(api[_-]?key|apikey|[_-]key$|\bkey\b|token|secret|passw|credential|bearer|\bsas\b|signature|\bsig\b|dsn|\bmac\b|private|hmac)")
+# A JSON/storage key worth flagging its string value even with no quotes around it.
+_JSON_KEY_CRED_RE = re.compile(r"(?i)(private|secret|passw|hmac|signing|master|netaxept|connection[_-]?string|api[_-]?key|apikey|token|credential|bearer|salt|signature|\bsig\b|\bmac\b|webhook|key$)")
+# An outgoing request header whose value is (or carries) a credential.
+_CRED_HEADER_RE = re.compile(r"(?i)^(authorization|x-api-key|api-?key|ocp-apim-subscription-key|subscription-key|x-algolia-api-key|x-algolia-application-id|x-auth-token|x-access-token|x-amz-security-token|signature)$")
+_AUTH_SCHEME_RE = re.compile(r"(?i)^(?:Bearer|Basic|APIKey|Token|Digest)\s+(\S+)")
 
 
 # (kind, severity, pattern), most specific first: a value is reported once, under the first kind that
@@ -1345,8 +1569,12 @@ _SECRET_PATTERNS = [(k, sev, re.compile(rx)) for k, sev, rx in [
     ("ai_api_key", "high", r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_\-]{32,}"),
     ("url_credentials", "high", r"\b[a-z][a-z0-9+.-]{1,20}://(?P<name>[^\s:/@\"'<>{}$`]{1,64}):(?P<v>[^\s:/@\"'<>{}$`]{3,128})@[\w.-]+"),
     ("auth_header_literal", "high", r"[\"'`](?P<name>Bearer|Basic|Token)\s+(?P<v>[A-Za-z0-9_\-+/=.~]{12,})[\"'`]"),
-    ("azure_sas_token", "medium", r"\bsv=\d{4}-\d\d-\d\d&[^\"'\s]*?sig=[A-Za-z0-9%+/=]{20,}"),
+    ("azure_sas_token", "medium", r"""(?i)(?:(?P<name>[\w$-]+)["']?\s*[:=]\s*["']\??)?(?P<v>sv=\d{4}-\d\d-\d\d&[^"'\s]*?sig=[A-Za-z0-9%+/=]{20,})"""),
     ("jwt", "medium", r"\beyJ[\w-]{10,}\.eyJ[\w-]{10,}\.[\w-]{10,}"),
+    # Application Insights: a GUID, bare or inside a ConnectionString=InstrumentationKey=<guid>;Ingestion...
+    ("app_insights_key", "medium", r"(?i)InstrumentationKey=(?P<v>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"),
+    # A GUID assigned to a key/token/secret/guid/id-named field (JS or unquoted config), e.g. App Insights.
+    ("guid_under_cred_name", "low", r"""(?i)(?P<name>[\w$-]{0,40}?(?:instrumentationkey|key|token|secret|guid|id))["']?\s*[:=]\s*["']?(?P<v>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"""),
     ("twilio_account_sid", "low", r"\bAC[0-9a-fA-F]{32}\b"),
     # Browser keys for Maps etc. are public by design; only a risk if unrestricted in the Google console.
     ("google_api_key", "low", r"\bAIza[0-9A-Za-z_\-]{35}\b"),
@@ -1358,7 +1586,7 @@ _SECRET_PATTERNS = [(k, sev, re.compile(rx)) for k, sev, rx in [
     # A credential-named variable assigned a literal. Catches build-time env blocks (NUXT_ENV_*,
     # NEXT_PUBLIC_*, VITE_*, REACT_APP_*) and config objects; _plausible drops identifiers.
     ("credential_assignment", "low",
-     r"""(?i)\b(?P<name>[\w$]*(?:(?:api|sso|access|secret|private|public|client|site|license|app|write|read|auth|sdk|search|admin|signing|encryption)[_-]?key|apikey|secret|token|passw(?:or)?d|credentials?|bearer|client[_-]?id|app(?:lication)?[_-]?id|dsn)[\w$]{0,8})["']?\s*[:=]\s*["'](?P<v>[A-Za-z0-9][A-Za-z0-9_\-+/=.%~]{7,})["']"""),
+     r"""(?i)(?P<name>[\w$-]*(?:[_-]?key|apikey|secret|token|passw(?:or)?d|credentials?|bearer|client[_-]?id|app(?:lication)?[_-]?id|dsn|signature|\bsig|sas)[\w$]{0,24})["']?\s*[:=]\s*["'](?P<v>[A-Za-z0-9][A-Za-z0-9_\-+/=.%~]{5,})["']"""),
     ("credential_in_url", "low",
      r"""[?&](?P<name>api_?key|apikey|key|token|access_token|auth|client_id)=(?P<v>[A-Za-z0-9_\-%.~]{16,})"""),
     ("internal_host", "info", r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|[a-z0-9.-]+\.(?:internal|corp|intranet|lan))\b"),
@@ -1367,11 +1595,14 @@ _REDACT_EXEMPT = {"internal_host"}
 _PLACEHOLDERS = {"password", "passwd", "secret", "changeme", "example", "username", "user", "pass", "xxxxxxxx"}
 
 
-def _plausible(kind: str, v: str) -> bool:
+def _plausible(kind: str, v: str, name: str = "") -> bool:
     """Drop placeholders and, for name-based kinds, identifiers that only look like values."""
     if len(set(v)) < 5 or v.lower() in _PLACEHOLDERS:  # 00000000-..., "password"
         return False
-    if kind in ("credential_assignment", "runtime_config"):
+    if name and _NAME_IS_CRED.search(name):
+        # the key name is credential-ish, so trust a short value (e.g. data-api-key="LCWZyk")
+        return len(v) >= 6
+    if kind in ("credential_assignment", "runtime_config", "json_field", "browser_storage"):
         # a digit, or long and mixed case (skips "gig_access_token", "sliderOptions")
         return bool(re.search(r"\d", v)) or (len(v) >= 16 and bool(re.search(r"[a-z]", v)) and bool(re.search(r"[A-Z]", v)))
     return True
@@ -1413,25 +1644,33 @@ _RUNTIME_JS = r"""() => {
   const NAME = /api.?key|apikey|secret|token|passw|credential|client.?id|app(lication)?.?id|dsn|bearer/i;
   const f = document.createElement('iframe'); f.style.display = 'none'; document.documentElement.appendChild(f);
   const builtin = new Set(Object.getOwnPropertyNames(f.contentWindow)); f.remove();
-  const out = [], seen = new WeakSet(); let budget = 20000;
-  const walk = (o, path, depth) => {
-    if (!o || typeof o !== 'object' || seen.has(o) || depth > 6 || --budget < 0) return;
+  const out = [], seen = new WeakSet();
+  const walk = (o, path, depth, b) => {
+    if (!o || typeof o !== 'object' || seen.has(o) || depth > 10 || --b.n < 0) return;
     if (o instanceof Node || o === window) return;
     seen.add(o);
     let keys; try { keys = Object.keys(o); } catch (e) { return; }
     for (const k of keys.slice(0, 500)) {
       let v; try { v = o[k]; } catch (e) { continue; }
-      if (typeof v === 'string') { if (NAME.test(k) && v.length >= 8 && v.length <= 500 && !/\s/.test(v)) out.push([path + '.' + k, v]); }
-      else if (v && typeof v === 'object') walk(v, path + '.' + k, depth + 1);
+      if (typeof v === 'string') { if (NAME.test(k) && v.length >= 8 && v.length <= 2000 && !/\s/.test(v)) out.push([path + '.' + k, v]); }
+      else if (v && typeof v === 'object') walk(v, path + '.' + k, depth + 1, b);
     }
   };
+  // Known config roots first, each with its own budget, so a big framework object can't starve them.
+  const PRI = ['__NEXT_DATA__', '__NUXT__', '__INITIAL_STATE__', 'staticSettings', 'digitalData', 'dataLayer', '__APP_CONFIG__', '__ENV__', 'env', 'config', 'runtimeConfig'];
+  for (const g of PRI) { try { if (window[g] && typeof window[g] === 'object') walk(window[g], 'window.' + g, 0, {n: 8000}); } catch (e) {} }
+  const budget = {n: 20000};
   for (const g of Object.getOwnPropertyNames(window)) {
-    if (builtin.has(g)) continue;
+    if (builtin.has(g) || PRI.includes(g)) continue;
     let v; try { v = window[g]; } catch (e) { continue; }
-    if (typeof v === 'string' && NAME.test(g) && v.length >= 8) out.push(['window.' + g, v]);
-    else walk(v, 'window.' + g, 0);
+    if (typeof v === 'string') { if (NAME.test(g) && v.length >= 8) out.push(['window.' + g, v]); }
+    else walk(v, 'window.' + g, 0, budget);
   }
-  return out.slice(0, 500);
+  const storage = [];
+  for (const [label, store] of [['localStorage', window.localStorage], ['sessionStorage', window.sessionStorage]]) {
+    try { for (let i = 0; i < store.length; i++) { const k = store.key(i); storage.push([label + '.' + k, store.getItem(k)]); } } catch (e) {}
+  }
+  return {globals: out.slice(0, 500), storage: storage.slice(0, 300)};
 }"""
 
 
@@ -1446,30 +1685,43 @@ async def _fetch_json(ctx, url):
 
 @mcp.tool()
 async def scan_secrets(check_source_maps: bool = True, candidates: bool = True, max_candidates: int = 50,
-                       reveal: bool = False, session: str = "") -> dict:
+                       reveal: bool = False, out_path: str = "", group: bool = True, session: str = "") -> dict:
     """List API keys, tokens and other credentials in what the page loaded since the last navigate.
 
-    Sources: documents, scripts, stylesheets and XHR/fetch responses captured since navigate, the
-    page's service worker scripts, and the page's live JS globals (catches config assembled at
-    runtime). Code the page never loaded (lazy chunks) isn't seen: click/scroll to load it first.
+    Sources: documents, scripts, stylesheets and XHR/fetch responses captured since navigate (response
+    bodies are also parsed as JSON and walked by key, including JSON strings nested inside JSON, so a
+    secret under any field name is flagged by its path); outgoing request headers (Authorization,
+    X-Api-Key, Ocp-Apim-Subscription-Key, ...), request URLs and POST bodies; the page's service
+    worker scripts; the page's live JS globals; and localStorage/sessionStorage. Code the page never
+    loaded (lazy chunks) isn't seen: click/scroll to load it first.
     findings, by pattern (most specific first, each value once), with severity:
       high: private keys, AWS, Azure storage, Stripe secret, GitHub, GitLab, npm, Shopify, SendGrid,
             Twilio, Hugging Face, Slack, Google OAuth secret, Mapbox secret, OpenAI/Anthropic keys,
             user:password@ in URLs/connection strings, hard-coded "Bearer/Basic …" headers.
-      medium: Azure SAS tokens, JWTs.  low: Google API keys, Twilio SIDs, credential-named
-            assignments (incl. env blocks like NUXT_ENV_*/NEXT_PUBLIC_*/VITE_*, reported with name),
-            keys in URL query strings, runtime_config (credential-named live globals).
+      medium: Azure SAS tokens, JWTs, Application Insights InstrumentationKey (bare or in a
+            ConnectionString).  low: Google API keys, Twilio SIDs, credential-named assignments (incl.
+            env blocks like NUXT_ENV_*/NEXT_PUBLIC_*/VITE_*, reported with name), keys in URL query
+            strings, runtime_config (credential-named live globals), GUIDs under a key/token/secret/id name.
       info: public-by-design client keys (Sentry DSN, Mapbox pk, Datadog RUM, Stripe pk), internal hosts.
     candidates: random-looking string literals in code that no pattern named (minified variables),
       highest entropy first, each with the preceding code as context (usually reveals the variable).
       Expect noise (content IDs, hashes): judge each by its context and shape.
     check_source_maps fetches each script's sourceMappingURL (one GET per map) and reports maps
     anyone can download, since they expose the original source.
-    Values are redacted (first4…last4) unless reveal=True, which returns them in full for the operator's
-    report on a target they are authorized to assess. Pattern hits are leads: confirm a key is live and
-    secret before reporting.
-    Returns {"result": {scanned, findings: [{kind, severity, value, name?, urls}], candidates:
-    [{value, length, entropy, context, url}], candidates_total, source_maps: [...]}}.
+    A value is reported once, under its most severe match; a value under a name containing private,
+    secret, password, hmac, signing, sas, bearer or credential is raised to high (so a real leaked key
+    isn't buried among public config). name is the variable, header, URL parameter or JSON path.
+    Values are redacted (first4…last4) unless reveal=True, which returns them in full for a responsible
+    disclosure. Pattern hits are leads: confirm a key is live and secret before reporting.
+    out_path writes the full result as JSON to that file (relative paths resolve against the server's
+    output folder; the file records whether values are redacted), to attach to a disclosure.
+    Each finding carries a short context snippet (the surrounding code) so the value can be judged in
+    situ without fetching the script. group=True (default) collapses repeats: hits sharing a name and
+    source become one entry with a count and up to three sample values (one minified Babel pattern can
+    yield hundreds of identical name=key hits); group=False returns every hit individually.
+    Returns {"result": {scanned, findings: [{kind, severity, name?, urls, context?, value | (count,
+    samples)}], candidates: [{value, length, entropy, context, url}], candidates_total, source_maps,
+    written?}}.
     """
     _use(session)
     page = await _page()
@@ -1477,17 +1729,26 @@ async def scan_secrets(check_source_maps: bool = True, candidates: bool = True, 
     show = (lambda v: v) if reveal else _redact
     sources = []  # (url, is_code, text)
     for r in list(_s()["requests"]):
-        if "_resp" in r and r["type"] in ("document", "script", "stylesheet", "xhr", "fetch", "other"):
+        if r["type"] not in ("document", "script", "stylesheet", "xhr", "fetch", "other"):
+            continue
+        if "_body" in r:  # recorded by http_request(record=True); already text
+            text = r["_body"]
+        elif "_resp" in r:
             try:
-                body = await r["_resp"].body()
+                text = (await r["_resp"].body())[:10_000_000].decode("utf-8", "replace")
             except Exception:
                 continue
-            sources.append((r["url"], r["type"] in ("document", "script"), body[:10_000_000].decode("utf-8", "replace"),
-                            r.get("response_headers") or {}))
+        else:
+            continue
+        sources.append((r["url"], r["type"] in ("document", "script"), text, r.get("response_headers") or {}))
     try:  # service worker scripts don't show up in the page's request log
-        sw_urls = await page.evaluate("""mw:async () => navigator.serviceWorker ? (await navigator.serviceWorker
+        # Isolated world (not mw:) on purpose: in the main world, Angular's Zone.js replaces Promise,
+        # so an awaited value comes back as a {__zone_symbol__...} wrapper instead of the array.
+        sw_urls = await page.evaluate("""async () => navigator.serviceWorker ? (await navigator.serviceWorker
             .getRegistrations()).map(r => (r.active || r.installing || r.waiting || {}).scriptURL).filter(Boolean) : []""")
     except Exception:
+        sw_urls = []
+    if not isinstance(sw_urls, list):
         sw_urls = []
     for url in sw_urls[:5]:
         try:
@@ -1498,21 +1759,89 @@ async def scan_secrets(check_source_maps: bool = True, candidates: bool = True, 
 
     found, maps, cands = {}, {}, {}
 
-    def add(kind, sev, value, url, name=None):
-        if not _plausible(kind, value):
+    def add(kind, sev, value, url, name=None, context=""):
+        if not value or len(value) > 8192 or not _plausible(kind, value, name or ""):
             return
+        if name and _STRONG_NAME.search(name) and _SEV_ORDER.get(sev, 9) > _SEV_ORDER["high"]:
+            sev = "high"  # a private/secret/password-named value is not a public id
         hit = found.setdefault(value, {"kind": kind, "severity": sev,
                                        "value": value if kind in _REDACT_EXEMPT else show(value), "urls": []})
+        if _SEV_ORDER[sev] < _SEV_ORDER[hit["severity"]]:  # same value under two kinds: keep the worse
+            hit["kind"], hit["severity"] = kind, sev
         if name and "name" not in hit:
             hit["name"] = name
+        if context and "context" not in hit:  # a snippet so the reviewer sees the value in situ
+            hit["context"] = context if kind in _REDACT_EXEMPT else context.replace(value, hit["value"])
         if url not in hit["urls"] and len(hit["urls"]) < 5:
             hit["urls"].append(url)
 
-    for url, is_code, text, hdrs in sources:
+    def add_candidate(value, context, url):
+        if candidates and value not in cands and value not in found and _is_candidate(value, ""):
+            cands[value] = {"value": show(value), "length": len(value), "entropy": round(_entropy(value), 2),
+                            "context": context[:80].replace("\n", " "), "url": url}
+
+    def scan_patterns(url, text):
         for kind, sev, rx in _SECRET_PATTERNS:
             for m in rx.finditer(text):
+                snip = text[max(0, m.start() - 45):m.end() + 25].replace("\n", " ").strip()
                 add(kind, sev, m.group("v") if "v" in rx.groupindex else m.group(0), url,
-                    m.group("name") if "name" in rx.groupindex else None)
+                    m.group("name") if "name" in rx.groupindex else None, context=snip[:120])
+
+    def walk_json(node, path, url, depth=0):
+        """Flag credential-named keys and high-entropy values by JSON path, recursing into
+        nested objects and into strings that are themselves JSON (double-serialised payloads)."""
+        if depth > 8:
+            return
+        items = node.items() if isinstance(node, dict) else enumerate(node[:200]) if isinstance(node, list) else ()
+        for k, v in items:
+            p = f"{path}.{k}" if path else str(k)
+            if isinstance(v, (dict, list)):
+                walk_json(v, p, url, depth + 1)
+            elif isinstance(v, str):
+                s = v.strip()
+                if s[:1] in "{[" and len(s) >= 2:
+                    try:
+                        walk_json(json.loads(s), p, url, depth + 1)
+                        continue
+                    except Exception:
+                        pass
+                if _JSON_KEY_CRED_RE.search(str(k)):
+                    add("json_field", "high" if _STRONG_NAME.search(str(k)) else "low", v, url, p)
+                else:
+                    add_candidate(v, p, url)
+
+    def maybe_json(url, text):
+        s = text.lstrip()
+        if s[:1] not in "{[":
+            return
+        try:
+            walk_json(json.loads(s), "", url)
+        except Exception:
+            pass
+
+    def scan_headers(hdrs, url):
+        for k, v in (hdrs or {}).items():
+            if not v or len(v) > 4096:
+                continue
+            if _CRED_HEADER_RE.match(k):
+                m = _AUTH_SCHEME_RE.match(v)
+                token = m.group(1) if m else v
+                sev = "high" if re.search(r"(?i)author|secret|security-token", k) else "medium"
+                add("request_header", sev, token, url, name=k)
+
+    # Request side: outgoing headers, the request URL, and POST bodies (gap: these carry keys too).
+    for r in list(_s()["requests"]):
+        ru = r["url"]
+        scan_headers(r.get("request_headers"), ru)
+        scan_patterns(ru, ru)
+        pd = r.get("post_data")
+        if pd:
+            scan_patterns(ru, pd[:1_000_000])
+            maybe_json(ru, pd[:1_000_000])
+
+    for url, is_code, text, hdrs in sources:
+        scan_patterns(url, text)
+        maybe_json(url, text)  # serialised API responses: structural + entropy by JSON path
         if is_code and candidates:
             for m in _LITERAL.finditer(text):
                 v = m.group(1)
@@ -1528,9 +1857,16 @@ async def scan_secrets(check_source_maps: bool = True, candidates: bool = True, 
     try:
         runtime = await page.evaluate("mw:" + _RUNTIME_JS)
     except Exception:
-        runtime = []
-    for path, value in runtime:
-        add("runtime_config", "low", value, page.url, path)
+        runtime = {}
+    for path, value in runtime.get("globals", []):
+        add("runtime_config", "high" if _STRONG_NAME.search(path) else "low", value, page.url, path)
+    for key, value in runtime.get("storage", []):  # localStorage/sessionStorage, often JSON blobs
+        if not value:
+            continue
+        scan_patterns(page.url, value[:1_000_000])
+        maybe_json(page.url, value[:1_000_000])
+        if value.strip()[:1] not in "{[" and _NAME_IS_CRED.search(key) and " " not in value and len(value) <= 500:
+            add("browser_storage", "high" if _STRONG_NAME.search(key) else "medium", value, page.url, key)
 
     source_maps = []
     if check_source_maps:
@@ -1545,19 +1881,193 @@ async def scan_secrets(check_source_maps: bool = True, candidates: bool = True, 
                 source_maps.append({"script": script, "map": map_url, "severity": "medium",
                                     "issue": f"source map publicly downloadable: {len(data['sources'])} original files",
                                     "sample_sources": data["sources"][:10]})
-    order = {"high": 0, "medium": 1, "low": 2, "info": 3}
     ranked = sorted((c for v, c in cands.items() if v not in found), key=lambda c: -c["entropy"])
-    return {"result": {"scanned": len(sources), "findings": sorted(found.values(), key=lambda f: order[f["severity"]]),
-                       "candidates": ranked[:max_candidates], "candidates_total": len(ranked),
-                       "source_maps": source_maps}}
+    # Collapse repeats: many hits share a name+source (e.g. Babel {key:"method"} patterns). Group them into
+    # one entry with a count and up to three sample values. group=False returns every hit individually.
+    if group:
+        buckets = {}
+        for f in found.values():
+            buckets.setdefault((f.get("name", ""), f["kind"], f["urls"][0] if f["urls"] else ""), []).append(f)
+        findings = []
+        for members in buckets.values():
+            if len(members) == 1:
+                findings.append(members[0])
+                continue
+            worst = min(members, key=lambda m: _SEV_ORDER[m["severity"]])
+            e = {"kind": worst["kind"], "severity": worst["severity"], "name": worst.get("name"),
+                 "urls": worst["urls"], "count": len(members), "samples": [m["value"] for m in members[:3]]}
+            if worst.get("context"):
+                e["context"] = worst["context"]
+            if e["name"] is None:
+                del e["name"]
+            findings.append(e)
+    else:
+        findings = list(found.values())
+    findings.sort(key=lambda f: _SEV_ORDER[f["severity"]])
+    result = {"scanned": len(sources), "findings": findings,
+              "candidates": ranked[:max_candidates], "candidates_total": len(ranked), "source_maps": source_maps}
+    if out_path:
+        report = {"url": page.url, "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "redacted": not reveal, **result}
+        dest = _out(out_path)
+        dest.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+        result["written"] = str(dest)
+    return {"result": result}
+
+
+# API endpoints named in JS bundles: a URL-ish value assigned to a *Url/*Endpoint/*Api name, an
+# http/fetch/axios call target, and the keys a page serialises into browser storage.
+_ENDPOINT_ASSIGN_RE = re.compile(
+    r"""(?P<name>[\w$]*(?:Url|Endpoint|Api|Origin|Uri|Path|Route|Host))\s*[:=]\s*[`"'](?P<url>(?:https?://|\$\{[^}]+\}|/)[^`"'\s]{2,200})[`"']""")
+_HTTP_CALL_RE = re.compile(
+    r"""(?<![\w$])(?:this\.)?(?:http|axios|fetch|\$http|httpClient)\s*(?:\.\s*(?P<method>get|post|put|delete|patch))?\s*\(\s*[`"'](?P<target>(?:https?://|\$\{[^}]+\}|/)[^`"'\s)]{2,200})[`"']""")
+_STORAGE_SINK_RE = re.compile(
+    r"""(?P<store>local|session)Storage\.setItem\(\s*[`"']?(?P<key>[\w.$@/-]{1,80})""")
+# A quoted/backtick string literal that itself looks like an API path, under ANY variable name
+# (e.g. o=`/rest-api/1/1/${t}/search`). A Python-side marker test keeps only the API-ish ones.
+_PATH_LIT_RE = re.compile(r"""[`"'](?P<url>(?:https?://|/)[^`"'\s]{1,200})[`"']""")
+_API_MARKER = re.compile(r"""(?i)/(?:rest-?api|api|appresource|graphql|gql|odata|rpc)(?:/|\b)|/download/|\.json(?:$|[?#])""")
+# A URL passed as a query-parameter value, e.g. ...drugservice.json?...&url=http://host:9003/TLV-drug-api/drugs/
+_QPARAM_URL_RE = re.compile(r"""[?&][\w.$-]{1,40}=(?P<url>https?://[^"'`\s&]{6,200})""")
+# A simple string-literal assignment, to resolve `base + "method"` concatenations across a scope.
+_STR_ASSIGN_RE = re.compile(r"""(?:^|[;,{(\s])(?P<v>[\w$]{1,40})\s*=\s*[`"'](?P<val>(?:https?://|/)[^`"'\s]{2,200})[`"']""")
+# A base (literal path or a resolved base variable) with a method segment appended, e.g.
+# "...TLV-drug-api/drugs/" + "getDrugDecisions"  or  base + "getDrugPrices".
+_CONCAT_RE = re.compile(r"""(?:[`"'](?P<base>(?:https?://|/)[^`"'\s]{1,200})[`"']|(?P<var>[\w$]{1,40}))\s*\+\s*[`"'](?P<seg>[\w./${}%-]{1,80})[`"']""")
+# A <script type="application/json"> config block (Sitevision app_props etc.) carrying endpoint keys.
+_JSON_SCRIPT_RE = re.compile(r"""<script[^>]*type=["']application/json["'][^>]*>(?P<body>.*?)</script>""", re.I | re.S)
+_CONFIG_KEY_RE = re.compile(r"(?i)(?:uri|url|route|endpoint)$")
+
+
+def _walk_config(node, depth=0):
+    """Yield (key, string-value) for keys ending in Uri/Url/Route/Endpoint, recursing into a parsed
+    application/json config block."""
+    if depth > 6:
+        return
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, str) and v and _CONFIG_KEY_RE.search(str(k)) and len(v) <= 300:
+                yield (str(k), v)
+            elif isinstance(v, (dict, list)):
+                yield from _walk_config(v, depth + 1)
+    elif isinstance(node, list):
+        for v in node[:200]:
+            if isinstance(v, (dict, list)):
+                yield from _walk_config(v, depth + 1)
+
+
+@mcp.tool()
+async def scan_endpoints(max_results: int = 300, session: str = "") -> dict:
+    """List API endpoints named in the JavaScript the page has already loaded, firing no requests.
+
+    Passive inventory, for mapping the API surface. Reads the
+    document and script bodies captured since the last navigate (and service worker scripts) and
+    extracts, by regex:
+      endpoints, by kind:
+        assign  - URL/path assigned to a *Url/*Endpoint/*Api/*Origin/*Uri/*Path/*Route name.
+        call    - target of http/fetch/axios .get/.post/...; method when the call names one.
+        path    - any string/template literal that looks like an API path (/rest-api/, /api/,
+                  /appresource/, *.json, /download/, graphql, ...) whatever variable holds it,
+                  e.g. o=`/rest-api/1/1/${t}/search`.
+        qparam  - a full URL carried as a query-parameter value, e.g. ...?...&url=http://host:9003/api/.
+        append  - a method/segment literal concatenated onto a base path or base variable, e.g.
+                  "...drug-api/drugs/" + "getDrugDecisions"; base is the left side it attaches to.
+        config  - a *Uri/*Url/*Route/*Endpoint key inside a <script type="application/json"> block
+                  (Sitevision app_props etc.: baseRouteUri, baseViewUri, baseResourceUri).
+        observed- an XHR/fetch the page actually fired since navigate (from the request log),
+                  deduped against the code findings, so one scan gives the full map.
+      Many assign/path/append entries never fire on the landing page; they sit in the bundle until a
+      flow (login, checkout) runs. Values keep template placeholders like ${apiOrigin}/Order.
+      storage_sinks: keys the code writes to localStorage/sessionStorage (where tokens/payloads land).
+    Lazy chunks the page never loaded aren't seen: navigate/click to load them first, then scan.
+    Returns {"result": {scanned, endpoints: [{kind, name?, method?, base?, url, source}], storage_sinks:
+    [{store, key, source}]}}. It only reports what the code contains; it does not call anything.
+    """
+    _use(session)
+    page = await _page()
+    ctx = page.context
+    texts = []  # (url, code)
+    for r in list(_s()["requests"]):
+        if r["type"] not in ("document", "script"):
+            continue
+        if "_body" in r:
+            texts.append((r["url"], r["_body"]))
+        elif "_resp" in r:
+            try:
+                texts.append((r["url"], (await r["_resp"].body())[:10_000_000].decode("utf-8", "replace")))
+            except Exception:
+                pass
+    try:
+        # Isolated world (not mw:) on purpose: in the main world, Angular's Zone.js replaces Promise,
+        # so an awaited value comes back as a {__zone_symbol__...} wrapper instead of the array.
+        sw_urls = await page.evaluate("""async () => navigator.serviceWorker ? (await navigator.serviceWorker
+            .getRegistrations()).map(r => (r.active || r.installing || r.waiting || {}).scriptURL).filter(Boolean) : []""")
+    except Exception:
+        sw_urls = []
+    if not isinstance(sw_urls, list):
+        sw_urls = []
+    for url in sw_urls[:5]:
+        try:
+            resp = await ctx.request.get(url)
+            texts.append((url, (await resp.body())[:10_000_000].decode("utf-8", "replace")))
+        except Exception:
+            pass
+
+    endpoints, sinks, seen = [], [], set()
+
+    def add_ep(kind, url, src, **extra):
+        if not url or ("", url) in seen:
+            return
+        seen.add(("", url))  # dedup a url across kinds so a path and its call don't both list
+        endpoints.append({"kind": kind, "url": url, "source": src, **extra})
+
+    assigns = {}  # simple `var = "url"` map, for resolving base+method concatenations
+    for src, code in texts:
+        for m in _STR_ASSIGN_RE.finditer(code):
+            assigns.setdefault(m.group("v"), m.group("val"))
+    for src, code in texts:
+        for m in _ENDPOINT_ASSIGN_RE.finditer(code):
+            add_ep("assign", m.group("url"), src, name=m.group("name"))
+        for m in _HTTP_CALL_RE.finditer(code):
+            add_ep("call", m.group("target"), src, method=m.group("method"))
+        # API-looking literals under any variable name, plus URLs embedded as query-parameter values.
+        for m in _PATH_LIT_RE.finditer(code):
+            u = m.group("url")
+            if _API_MARKER.search(u):
+                add_ep("path", u, src)
+            for qm in _QPARAM_URL_RE.finditer(u):
+                add_ep("qparam", qm.group("url"), src)
+        # Method/segment literals appended onto a base literal or a resolved base variable.
+        for m in _CONCAT_RE.finditer(code):
+            base = m.group("base") or assigns.get(m.group("var") or "")
+            if base and base[:1] in "/h" and _API_MARKER.search(base + m.group("seg")):
+                add_ep("append", base.rstrip("/") + "/" + m.group("seg").lstrip("/"), src,
+                       base=base, name=m.group("var") or None)
+        # Endpoints declared in application/json config blocks (keys ending Uri/Url/Route/Endpoint).
+        for jm in _JSON_SCRIPT_RE.finditer(code):
+            try:
+                data = json.loads(jm.group("body").strip())
+            except Exception:
+                continue
+            for name, val in _walk_config(data):
+                add_ep("config", val, src, name=name)
+        for m in _STORAGE_SINK_RE.finditer(code):
+            key = ("sink", m.group("store"), m.group("key"))
+            if key not in seen:
+                seen.add(key)
+                sinks.append({"store": m.group("store"), "key": m.group("key"), "source": src})
+    # Merge traffic actually observed since navigate (XHR/fetch), deduped against the code findings.
+    for r in list(_s()["requests"]):
+        if r["type"] in ("xhr", "fetch"):
+            add_ep("observed", r["url"], "observed", method=r.get("method"))
+    return {"result": {"scanned": len(texts), "endpoints": endpoints[:max_results], "storage_sinks": sinks[:max_results]}}
 
 
 @mcp.tool()
 async def cors_check(url: str = "", method: str = "GET", session: str = "") -> dict:
     """Check which origins an endpoint's CORS policy lets read its responses.
 
-    An active check that sends its own requests; the operator runs this server against targets they
-    are authorized to assess.
+    An active check that sends its own requests;
     url defaults to the current page. Sends method with Origin set to an unrelated site, "null",
     names that start or end like the host (checks that an allowlist matches whole origins) and the
     http:// variant, plus one preflight, using the browser's cookies (CORS settings matter most on
@@ -1640,8 +2150,7 @@ _EXPOSURES = [
 async def exposure_check(base_url: str = "", paths: list[str] | None = None, session: str = "") -> dict:
     """Check that common private files (.git, .env, config and status pages) aren't publicly reachable.
 
-    An active check that sends its own requests; the operator runs this server against targets they
-    are authorized to assess.
+    An active check that sends its own requests;
     Checks the origin of base_url (default: the current page) for .git, .env, .svn, .htpasswd, Spring
     actuator, server-status, phpinfo, .DS_Store, crossdomain.xml and OpenAPI docs, ~16 GET requests with
     the browser's cookies and no redirects followed. A path counts as exposed only when its body

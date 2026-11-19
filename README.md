@@ -96,7 +96,7 @@ Any other MCP client, as a stdio server:
 
 **Security review**
 
-These check how a site is configured and report findings with a severity, for the site's owners and testers.
+These check how a site is configured and report findings for disclouse.
 
 | Tool | What it checks |
 |---|---|
