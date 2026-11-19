@@ -1709,7 +1709,7 @@ async def scan_secrets(check_source_maps: bool = True, candidates: bool = True, 
     check_source_maps fetches each script's sourceMappingURL (one GET per map) and reports maps
     anyone can download, since they expose the original source.
     A value is reported once, under its most severe match; a value under a name containing private,
-    secret, password, hmac, signing, sas, bearer or credential is raised to high (so a real leaked key
+    secret, password, hmac, signing, sas, bearer or credential is raised to high (so a real credential
     isn't buried among public config). name is the variable, header, URL parameter or JSON path.
     Values are redacted (first4…last4) unless reveal=True, which returns them in full (e.g. to tell a
     site owner exactly which key to rotate). A pattern match shows the value's shape, not that it is live.
@@ -1960,7 +1960,7 @@ def _walk_config(node, depth=0):
 async def scan_endpoints(max_results: int = 300, session: str = "") -> dict:
     """List API endpoints named in the JavaScript the page has already loaded, firing no requests.
 
-    Passive inventory, for mapping the API surface. Reads the
+    Passive inventory of the API endpoints the page's own code references. Reads the
     document and script bodies captured since the last navigate (and service worker scripts) and
     extracts, by regex:
       endpoints, by kind:
@@ -2297,7 +2297,7 @@ _SESSION_COOKIE = re.compile(r"sess|sid|auth|token|jwt|login", re.I)
 @mcp.tool()
 async def session_audit(action: str, label: str = "before", url: str = "", expect_text: str = "",
                         session: str = "") -> dict:
-    """Test session handling around login and logout: fixation and logout invalidation.
+    """Check session handling around login and logout: a new session ID at login, logout invalidation.
 
     action="mark"    remember the current cookies under label.
     action="compare" diff the current cookies against label's. A session-like cookie (name has sess,
