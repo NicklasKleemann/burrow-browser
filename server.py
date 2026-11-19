@@ -38,7 +38,7 @@ import re
 import socket
 import ssl as ssl_mod
 import time
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from camoufox import DefaultAddons
 from camoufox.async_api import AsyncCamoufox
@@ -87,9 +87,13 @@ INSTRUCTIONS = (
     "blocking, instant animations, image and WebRTC blocking, geoip), and set_identity gives one session "
     "its own OS, locale, timezone, geolocation, viewport, color scheme or a fresh random fingerprint. "
     "Security review: "
-    "scan_secrets lists API keys, tokens and downloadable source maps in the code a page loaded; "
-    "cors_check, exposure_check, tls_audit and session_audit check a site's CORS, public files, TLS and "
-    "login/logout session handling by sending their own requests. "
+    "scan_secrets lists API keys, tokens and downloadable source maps in the code a page loaded, and "
+    "scan_endpoints and page_audit read the loaded code for API endpoints, insecure subresources, "
+    "missing SRI and library versions without sending anything. "
+    "cors_check, exposure_check, tls_audit, session_audit, security_headers, http_methods, "
+    "graphql_introspection, content_discovery (path wordlist), forbidden_bypass (401/403 retries) and "
+    "inject_probe (query-parameter payloads: sqli/traversal/ssti/cmdi/xss/redirect) each send their own "
+    "requests and report findings with a severity. "
     "Separately, http_request makes one raw HTTP(S) call with the connection IP, Host header and TLS SNI "
     "set independently (DNS/vhost/origin testing, like curl --resolve). "
     "get_text, get_html, links, requests, evaluate and screenshot all return {'result': <value>}. "
@@ -2343,6 +2347,359 @@ async def session_audit(action: str, label: str = "before", url: str = "", expec
         return {"result": {"url": url, "status": resp.status, "final_url": resp.url, "bytes": len(body),
                            "contains_expect_text": hit if expect_text else None}, "findings": findings}
     raise ValueError(f"Unknown action {action!r}; use mark, compare or replay.")
+
+
+def _set_param(url: str, name: str, value: str) -> str:
+    u = urlsplit(url)
+    q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True) if k != name] + [(name, value)]
+    return urlunsplit((u.scheme, u.netloc, u.path, urlencode(q), u.fragment))
+
+
+def _query_names(url: str) -> list:
+    return list(dict.fromkeys(k for k, _ in parse_qsl(urlsplit(url).query, keep_blank_values=True)))
+
+
+def _redirects_to(loc: str, host: str) -> bool:
+    """A Location that points off-site to host (absolute, scheme-relative, or backslash variant)."""
+    if not loc:
+        return False
+    s = loc.strip().replace("\\", "/")
+    if s.startswith(("//", "http://", "https://")):
+        try:
+            h = (urlsplit(s if s.startswith("//") else s).hostname) or ""
+        except Exception:
+            return False
+        return h == host or h.endswith("." + host)
+    return False
+
+
+@mcp.tool()
+async def page_audit(session: str = "") -> dict:
+    """Passive hygiene of the page already loaded: insecure subresources, missing SRI, library versions.
+
+    Reads the request log and the DOM; fires no requests. Reports:
+      mixed_content: http:// subresources on an https page (active = script/xhr/stylesheet, higher).
+      missing_sri:   external <script>/<link> loaded without an integrity= attribute.
+      libraries:     JS libs and versions read from live globals (jQuery/React/Angular/Vue/lodash/...)
+                     and from versioned script filenames, so a reviewer can look up known advisories.
+      insecure_forms: <form> whose action posts over http.
+    Returns {"result": {url, https, findings: [{severity, issue, url?}], mixed_content, missing_sri,
+    insecure_forms, libraries: {globals, from_urls}}}.
+    """
+    _use(session)
+    page = await _page()
+    reqs = list(_s()["requests"])
+    https = page.url.startswith("https:")
+    active_types = {"script", "xhr", "fetch", "stylesheet", "document", "websocket", "eventsource"}
+    mixed, seen = [], set()
+    if https:
+        for r in reqs:
+            u = r["url"]
+            if u[:5].lower() == "http:" and u not in seen:
+                seen.add(u)
+                mixed.append({"type": r["type"], "url": u, "active": r["type"] in active_types})
+    dom = await page.evaluate("mw:" + r"""() => {
+      const origin = location.origin, ext = [], forms = [];
+      const isExt = u => { try { return new URL(u, origin).origin !== origin; } catch (e) { return false; } };
+      for (const s of document.querySelectorAll('script[src]')) ext.push({tag: 'script', url: s.src, integrity: !!s.integrity, external: isExt(s.src)});
+      for (const l of document.querySelectorAll('link[rel~="stylesheet"][href]')) ext.push({tag: 'link', url: l.href, integrity: !!l.integrity, external: isExt(l.href)});
+      for (const f of document.querySelectorAll('form[action]')) { const a = f.getAttribute('action') || ''; if (/^http:\/\//i.test(a) || (/^\/\//.test(a) === false && location.protocol === 'http:' && a)) forms.push(f.action); }
+      const g = window, libs = {}, pk = (n, v) => { if (v) libs[n] = String(v).slice(0, 40); };
+      try { pk('jQuery', g.jQuery && g.jQuery.fn && g.jQuery.fn.jquery); } catch (e) {}
+      try { pk('React', g.React && g.React.version); } catch (e) {}
+      try { pk('Angular', g.angular && g.angular.version && g.angular.version.full); } catch (e) {}
+      try { pk('Vue', g.Vue && g.Vue.version); } catch (e) {}
+      try { pk('lodash', g._ && g._.VERSION); } catch (e) {}
+      try { pk('moment', g.moment && g.moment.version); } catch (e) {}
+      try { pk('d3', g.d3 && g.d3.version); } catch (e) {}
+      try { pk('bootstrap', g.bootstrap && g.bootstrap.Tooltip && g.bootstrap.Tooltip.VERSION); } catch (e) {}
+      try { pk('Next.js', g.__NEXT_DATA__ && 'present'); } catch (e) {}
+      return {ext, forms, libs};
+    }""")
+    missing_sri = [e for e in dom["ext"] if e["external"] and not e["integrity"]]
+    rx = re.compile(r"/([A-Za-z][\w.-]*?)[-.@]v?(\d+\.\d+(?:\.\d+)?)(?:[.-]min)?\.js", re.I)
+    url_libs, seen_lib = [], set()
+    for r in reqs:
+        if r["type"] == "script":
+            m = rx.search(r["url"].split("?")[0])
+            if m and (m.group(1), m.group(2)) not in seen_lib:
+                seen_lib.add((m.group(1), m.group(2)))
+                url_libs.append({"name": m.group(1), "version": m.group(2)})
+    findings = []
+    for m in mixed:
+        findings.append({"severity": "high" if m["active"] else "medium",
+                         "issue": f"Mixed content: {m['type']} loaded over http", "url": m["url"]})
+    for f in dom["forms"]:
+        findings.append({"severity": "medium", "issue": "Form action posts over http", "url": f})
+    for e in missing_sri:
+        findings.append({"severity": "low", "issue": f"External {e['tag']} without integrity=", "url": e["url"]})
+    return {"result": {"url": page.url, "https": https, "findings": findings,
+                       "mixed_content": mixed[:200], "missing_sri": missing_sri[:200],
+                       "insecure_forms": dom["forms"][:100],
+                       "libraries": {"globals": dom["libs"], "from_urls": url_libs[:100]}}}
+
+
+# (kind, payload, body-signature | None, severity, note). None signature = redirect kind (checks Location).
+_INJECT = {
+    "sqli": [("'", r"(?i)sql syntax|sqlstate|unclosed quotation|ORA-\d{5}|psql:|mysql_fetch|SQLiteException|npgsql|syntax error at or near|Warning:\s+(?:mysqli?|pg)_", "high", "SQL error reflected"),
+             ('";', r"(?i)sql syntax|sqlstate|ORA-\d{5}|SQLiteException|syntax error at or near", "high", "SQL error reflected")],
+    "traversal": [("../../../../../../etc/passwd", r"root:.*?:0:0:", "high", "/etc/passwd contents returned"),
+                  ("....//....//....//....//etc/passwd", r"root:.*?:0:0:", "high", "/etc/passwd via ....// returned"),
+                  ("..\\..\\..\\..\\..\\windows\\win.ini", r"(?i)\[fonts\]|\[extensions\]", "high", "win.ini contents returned")],
+    "ssti": [("brw{{7*7}}", r"brw49", "high", "{{7*7}} evaluated to 49"),
+             ("brw${7*7}", r"brw49", "high", "${7*7} evaluated to 49"),
+             ("brw<%=7*7%>", r"brw49", "medium", "<%=7*7%> evaluated to 49")],
+    "cmdi": [(";id", r"uid=\d+\(", "high", "`id` output (uid=) returned"),
+             ("|id", r"uid=\d+\(", "high", "`id` output returned"),
+             ("`id`", r"uid=\d+\(", "high", "`id` output returned")],
+    "xss": [("brw<svg/onload=alert(1)>", r"brw<svg/onload=alert\(1\)>", "medium", "payload reflected unencoded in HTML")],
+    "redirect": [("https://burrow-redirect.example/", None, "high", "open redirect: Location honors the parameter")],
+}
+_INJECT_KINDS = list(_INJECT)
+
+
+@mcp.tool()
+async def inject_probe(url: str = "", params: list[str] | None = None, kinds: list[str] | None = None,
+                       session: str = "") -> dict:
+    """Fuzz query parameters with one obvious payload per class and report the ones that bite.
+
+    For each param × kind, sends the payload in that parameter (GET, with the browser's cookies, no
+    redirects followed) and matches a single tell in the response. Read-only payloads only (7*7, id,
+    /etc/passwd) — nothing that writes or deletes. A hit is a lead to confirm by hand, not a proof.
+      sqli      a quote → a database error in the body
+      traversal ../../etc/passwd and ....// and win.ini → file contents in the body
+      ssti      {{7*7}} / ${7*7} / <%=7*7%> (marked) → 49 in the body
+      cmdi      ;id / |id / `id` → uid=… in the body
+      xss       a marked <svg onload> → the payload reflected unencoded
+      redirect  an off-site URL → a 3xx whose Location honors it (open redirect)
+    url defaults to the current page. params defaults to the URL's own query parameters (nothing to
+    test if there are none — pass params to add your own). kinds defaults to all of the above.
+    Returns {"result": {url, tested_params, checks: [{param, kind, status, hit}], findings:
+    [{severity, param, kind, issue, evidence}]}}.
+    """
+    _use(session)
+    page = await _page()
+    url = url or page.url
+    names = params or _query_names(url)
+    kinds = kinds or _INJECT_KINDS
+    if not names:
+        return {"result": {"url": url, "findings": [], "checks": [],
+                           "note": "no query parameters to test; pass params=[...]"}}
+    checks, findings = [], []
+    for name in names:
+        for kind in kinds:
+            for payload, sig, sev, note in _INJECT.get(kind, []):
+                test = _set_param(url, name, payload)
+                try:
+                    resp = await page.context.request.get(test, max_redirects=0)
+                except Exception as e:
+                    checks.append({"param": name, "kind": kind, "error": str(e)[:160]})
+                    continue
+                if kind == "redirect":
+                    loc = resp.headers.get("location", "")
+                    hit, evidence = (resp.status in (301, 302, 303, 307, 308) and
+                                     _redirects_to(loc, "burrow-redirect.example")), loc[:160]
+                else:
+                    try:
+                        body = (await resp.text())[:1_000_000]
+                    except Exception:
+                        body = ""
+                    hit, evidence = bool(re.search(sig, body)), note
+                checks.append({"param": name, "kind": kind, "status": resp.status, "hit": hit})
+                if hit:
+                    findings.append({"severity": sev, "param": name, "kind": kind,
+                                     "issue": f"{kind}: {note}", "evidence": evidence})
+                    break  # one payload per (param, kind) is enough
+    return {"result": {"url": url, "tested_params": names, "checks": checks, "findings": findings}}
+
+
+# A compact default wordlist for content discovery; pass wordlist=[...] for a bigger/targeted run.
+_COMMON_PATHS = [
+    "admin", "administrator", "login", "logout", "register", "signup", "account", "user", "users",
+    "dashboard", "config", "config.json", "settings", "api", "api/v1", "api/v2", "graphql", "console",
+    "backup", "backup.zip", "backup.sql", "db.sql", "dump.sql", "database.sql", "old", "new", "test",
+    "tests", "dev", "staging", "stage", "tmp", "temp", "uploads", "upload", "files", "file", "assets",
+    "static", "private", "internal", "secret", "secrets", "debug", "trace", "status", "health",
+    "healthz", "metrics", "actuator", "actuator/env", "server-status", "server-info", "info.php",
+    "phpinfo.php", "phpmyadmin", "wp-admin", "wp-login.php", "wp-config.php", ".git/config", ".env",
+    ".env.local", ".svn/entries", ".DS_Store", "robots.txt", "sitemap.xml", "swagger", "swagger-ui",
+    "swagger.json", "openapi.json", "readme.md", "README.md", "CHANGELOG.md", "LICENSE", "docs",
+    "download", "export", "logs", "log", "error.log", "access.log", "cgi-bin", "jenkins", "grafana",
+    "kibana", "redis", "api-docs", "v2/api-docs", ".well-known/security.txt",
+]
+
+
+@mcp.tool()
+async def content_discovery(base_url: str = "", wordlist: list[str] | None = None,
+                            extensions: list[str] | None = None, max_paths: int = 500,
+                            session: str = "") -> dict:
+    """Request a wordlist of paths against an origin and report the ones that exist (directory brute).
+
+    GETs each path on the origin of base_url (default: the current page) with the browser's cookies and
+    no redirects, concurrently. A random path establishes the soft-404 baseline: a 200 only counts when
+    its body differs from that baseline, so a catch-all 200 site isn't a wall of false hits. 401/403/
+    3xx are reported too (the path exists but is protected or moved). Nothing is written.
+      wordlist   paths to try (no leading slash needed); defaults to a built-in common list.
+      extensions appended to each word, e.g. ["", ".bak", ".json", ".zip"].
+    Returns {"result": {origin, baseline_status, findings: [{path, status, bytes, note}], tried}}.
+    """
+    _use(session)
+    page = await _page()
+    u = urlsplit(base_url or page.url)
+    if u.scheme not in ("http", "https"):
+        raise ValueError("Navigate to an http(s) page first or pass base_url.")
+    origin = f"{u.scheme}://{u.netloc}"
+    words = list(dict.fromkeys(wordlist or _COMMON_PATHS))
+    exts = extensions or [""]
+    paths = list(dict.fromkeys(w.lstrip("/") + e for w in words for e in exts))[:max_paths]
+    baseline_path = f"burrow-{secrets.token_hex(8)}"
+
+    async def get(path):
+        try:
+            resp = await page.context.request.get(f"{origin}/{path}", max_redirects=0)
+            return path, resp.status, len(await resp.body())
+        except Exception as e:
+            return path, None, str(e)[:80]
+
+    _, base_status, base_len = await get(baseline_path)
+    results = []
+    for i in range(0, len(paths), 25):  # chunked so a big list doesn't open hundreds of sockets at once
+        results.extend(await asyncio.gather(*(get(p) for p in paths[i:i + 25])))
+    findings = []
+    for path, status, size in results:
+        if status is None:
+            continue
+        if status == 200 and base_status == 200 and isinstance(size, int) and size == base_len:
+            continue  # looks like the catch-all page
+        if status in (200, 201, 204, 301, 302, 307, 308, 401, 403, 405, 500):
+            note = {401: "protected", 403: "protected", 500: "error"}.get(status,
+                   "redirect" if status in (301, 302, 307, 308) else "reachable")
+            findings.append({"path": "/" + path, "status": status, "bytes": size if isinstance(size, int) else None,
+                             "note": note})
+    findings.sort(key=lambda f: (f["status"] != 200, f["status"]))
+    return {"result": {"origin": origin, "baseline_status": base_status, "findings": findings, "tried": len(paths)}}
+
+
+@mcp.tool()
+async def forbidden_bypass(url: str = "", session: str = "") -> dict:
+    """Retry a 401/403 URL with the common header and path tricks and report any that reach 200.
+
+    Sends the request once as-is, then re-sends it with X-Forwarded-For/-Host, X-Original-URL,
+    X-Rewrite-URL, Referer, and with path variants (trailing slash, /./, %2e, ..;/, case flip). Reports
+    each trick that turns the original 401/403 into a 2xx. Uses the browser's cookies, no redirects.
+    Returns {"result": {url, baseline_status, findings: [{trick, detail, status}], checks}}.
+    """
+    _use(session)
+    page = await _page()
+    url = url or page.url
+    u = urlsplit(url)
+    origin, path = f"{u.scheme}://{u.netloc}", u.path or "/"
+
+    async def send(target, headers=None):
+        try:
+            resp = await page.context.request.get(target, headers=headers or {}, max_redirects=0)
+            return resp.status
+        except Exception as e:
+            return str(e)[:80]
+
+    base = await send(url)
+    checks = [{"trick": "baseline", "detail": url, "status": base}]
+    if base not in (401, 403):
+        return {"result": {"url": url, "baseline_status": base, "findings": [],
+                           "checks": checks, "note": "baseline is not 401/403; nothing to bypass"}}
+    variants = [("header X-Forwarded-For", url, {"X-Forwarded-For": "127.0.0.1"}),
+                ("header X-Forwarded-Host", url, {"X-Forwarded-Host": "127.0.0.1"}),
+                ("header X-Original-URL", origin + "/", {"X-Original-URL": path}),
+                ("header X-Rewrite-URL", origin + "/", {"X-Rewrite-URL": path}),
+                ("header X-Custom-IP-Authorization", url, {"X-Custom-IP-Authorization": "127.0.0.1"}),
+                ("header Referer", url, {"Referer": origin + path}),
+                ("path trailing-slash", origin + path + "/", None),
+                ("path /./", origin + "/." + path, None),
+                ("path %2e", origin + path + "%2e", None),
+                ("path ..;/", origin + path + "/..;/", None),
+                ("path dot-suffix", origin + path + ".", None),
+                ("path case-flip", origin + _swapcase(path), None)]
+    findings = []
+    for trick, target, headers in variants:
+        st = await send(target, headers)
+        checks.append({"trick": trick, "detail": (headers or target), "status": st})
+        if isinstance(st, int) and 200 <= st < 300:
+            findings.append({"trick": trick, "detail": (headers or target), "status": st})
+    return {"result": {"url": url, "baseline_status": base, "findings": findings, "checks": checks}}
+
+
+def _swapcase(s):
+    return "".join(c.swapcase() if c.isalpha() else c for c in s)
+
+
+@mcp.tool()
+async def http_methods(url: str = "", include_write: bool = False, session: str = "") -> dict:
+    """Report which HTTP methods a URL accepts: OPTIONS Allow, TRACE, and (opt-in) PUT/DELETE/PATCH.
+
+    Sends OPTIONS (reads the Allow header) and TRACE (enabled TRACE allows Cross-Site Tracing). These
+    don't change state. include_write=True also sends PUT, DELETE and PATCH with an empty body, which
+    could modify data on a write endpoint — only enable it when that's acceptable on the target.
+    Returns {"result": {url, allow, checks: [{method, status}], findings: [{severity, issue}]}}.
+    """
+    _use(session)
+    page = await _page()
+    url = url or page.url
+    checks, findings, allow = [], [], ""
+
+    async def send(m):
+        try:
+            resp = await page.context.request.fetch(url, method=m, max_redirects=0)
+            return resp.status, resp.headers.get("allow", "")
+        except Exception as e:
+            return None, str(e)[:120]
+
+    st, allow = await send("OPTIONS")
+    checks.append({"method": "OPTIONS", "status": st, "allow": allow})
+    if allow:
+        risky = [m for m in ("PUT", "DELETE", "TRACE", "CONNECT", "PATCH") if m in allow.upper()]
+        if risky:
+            findings.append({"severity": "low", "issue": f"OPTIONS advertises {', '.join(risky)}", "allow": allow})
+    methods = ["TRACE"] + (["PUT", "DELETE", "PATCH"] if include_write else [])
+    for m in methods:
+        st, _ = await send(m)
+        checks.append({"method": m, "status": st})
+        if m == "TRACE" and st == 200:
+            findings.append({"severity": "medium", "issue": "TRACE enabled (Cross-Site Tracing)"})
+        elif isinstance(st, int) and st not in (405, 501, 403, 401, 400, 404, 301, 302, 308):
+            findings.append({"severity": "info", "issue": f"{m} returns {st}: the method may be enabled"})
+    return {"result": {"url": url, "allow": allow, "checks": checks, "findings": findings}}
+
+
+@mcp.tool()
+async def graphql_introspection(url: str = "", session: str = "") -> dict:
+    """Check whether a GraphQL endpoint answers an introspection query, and list its type names if so.
+
+    POSTs a minimal introspection query (read-only) to url, or to <origin>/graphql when url is omitted.
+    Introspection left on in production hands an attacker the full schema. Uses the browser's cookies.
+    Returns {"result": {url, status, introspection_enabled, type_count, types, findings}}.
+    """
+    _use(session)
+    page = await _page()
+    if not url:
+        u = urlsplit(page.url)
+        url = f"{u.scheme}://{u.netloc}/graphql"
+    query = {"query": "query{__schema{queryType{name} types{name kind}}}"}
+    try:
+        resp = await page.context.request.post(url, data=json.dumps(query),
+                                               headers={"content-type": "application/json"}, max_redirects=0)
+        body = await resp.text()
+        status = resp.status
+    except Exception as e:
+        return {"result": {"url": url, "error": str(e)[:160], "introspection_enabled": False, "findings": []}}
+    try:
+        schema = (json.loads(body).get("data") or {}).get("__schema") or {}
+    except Exception:
+        schema = {}
+    types = [t["name"] for t in schema.get("types", []) if not str(t.get("name", "")).startswith("__")]
+    enabled = bool(types)
+    findings = [{"severity": "info", "issue": f"GraphQL introspection enabled: {len(types)} types exposed"}] if enabled else []
+    return {"result": {"url": url, "status": status, "introspection_enabled": enabled,
+                       "type_count": len(types), "types": types[:300], "findings": findings}}
 
 
 if __name__ == "__main__":
