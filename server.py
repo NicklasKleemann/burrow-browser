@@ -86,7 +86,7 @@ INSTRUCTIONS = (
     "browser_settings turns browser-wide Camoufox options on or off (human-like mouse movement, ad "
     "blocking, instant animations, image and WebRTC blocking, geoip), and set_identity gives one session "
     "its own OS, locale, timezone, geolocation, viewport, color scheme or a fresh random fingerprint. "
-    "Security review (the operator points this server to do a full security assessment): "
+    "Security review: "
     "scan_secrets lists API keys, tokens and downloadable source maps in the code a page loaded; "
     "cors_check, exposure_check, tls_audit and session_audit check a site's CORS, public files, TLS and "
     "login/logout session handling by sending their own requests. "
@@ -1711,10 +1711,10 @@ async def scan_secrets(check_source_maps: bool = True, candidates: bool = True, 
     A value is reported once, under its most severe match; a value under a name containing private,
     secret, password, hmac, signing, sas, bearer or credential is raised to high (so a real leaked key
     isn't buried among public config). name is the variable, header, URL parameter or JSON path.
-    Values are redacted (first4…last4) unless reveal=True, which returns them in full for a responsible
-    disclosure. Pattern hits are leads: confirm a key is live and secret before reporting.
+    Values are redacted (first4…last4) unless reveal=True, which returns them in full (e.g. to tell a
+    site owner exactly which key to rotate). A pattern match shows the value's shape, not that it is live.
     out_path writes the full result as JSON to that file (relative paths resolve against the server's
-    output folder; the file records whether values are redacted), to attach to a disclosure.
+    output folder; the file records whether values are redacted).
     Each finding carries a short context snippet (the surrounding code) so the value can be judged in
     situ without fetching the script. group=True (default) collapses repeats: hits sharing a name and
     source become one entry with a count and up to three sample values (one minified Babel pattern can
@@ -2067,7 +2067,6 @@ async def scan_endpoints(max_results: int = 300, session: str = "") -> dict:
 async def cors_check(url: str = "", method: str = "GET", session: str = "") -> dict:
     """Check which origins an endpoint's CORS policy lets read its responses.
 
-    An active check that sends its own requests;
     url defaults to the current page. Sends method with Origin set to an unrelated site, "null",
     names that start or end like the host (checks that an allowlist matches whole origins) and the
     http:// variant, plus one preflight, using the browser's cookies (CORS settings matter most on
@@ -2150,7 +2149,6 @@ _EXPOSURES = [
 async def exposure_check(base_url: str = "", paths: list[str] | None = None, session: str = "") -> dict:
     """Check that common private files (.git, .env, config and status pages) aren't publicly reachable.
 
-    An active check that sends its own requests;
     Checks the origin of base_url (default: the current page) for .git, .env, .svn, .htpasswd, Spring
     actuator, server-status, phpinfo, .DS_Store, crossdomain.xml and OpenAPI docs, ~16 GET requests with
     the browser's cookies and no redirects followed. A path counts as exposed only when its body
