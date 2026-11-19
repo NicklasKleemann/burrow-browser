@@ -2464,8 +2464,8 @@ async def inject_probe(url: str = "", params: list[str] | None = None, kinds: li
     """Fuzz query parameters with one obvious payload per class and report the ones that bite.
 
     For each param × kind, sends the payload in that parameter (GET, with the browser's cookies, no
-    redirects followed) and matches a single tell in the response. Read-only payloads only (7*7, id,
-    /etc/passwd) — nothing that writes or deletes. A hit is a lead to confirm by hand, not a proof.
+    redirects followed) and matches a single tell in the response. The payloads read only (7*7, id,
+    /etc/passwd); none write or delete.
       sqli      a quote → a database error in the body
       traversal ../../etc/passwd and ....// and win.ini → file contents in the body
       ssti      {{7*7}} / ${7*7} / <%=7*7%> (marked) → 49 in the body
@@ -2638,7 +2638,7 @@ async def http_methods(url: str = "", include_write: bool = False, session: str 
 
     Sends OPTIONS (reads the Allow header) and TRACE (enabled TRACE allows Cross-Site Tracing). These
     don't change state. include_write=True also sends PUT, DELETE and PATCH with an empty body, which
-    could modify data on a write endpoint — only enable it when that's acceptable on the target.
+    write on a write endpoint.
     Returns {"result": {url, allow, checks: [{method, status}], findings: [{severity, issue}]}}.
     """
     _use(session)
@@ -2675,7 +2675,7 @@ async def graphql_introspection(url: str = "", session: str = "") -> dict:
     """Check whether a GraphQL endpoint answers an introspection query, and list its type names if so.
 
     POSTs a minimal introspection query (read-only) to url, or to <origin>/graphql when url is omitted.
-    Introspection left on in production hands an attacker the full schema. Uses the browser's cookies.
+    Introspection left on in production exposes the full schema. Uses the browser's cookies.
     Returns {"result": {url, status, introspection_enabled, type_count, types, findings}}.
     """
     _use(session)
