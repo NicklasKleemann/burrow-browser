@@ -9,7 +9,8 @@ Agents use it to:
 - see every network request a page makes, read response bodies, and record traffic to a HAR file
 - collect console errors, CSP violations, dialogs, websockets and storage contents
 - mock or fail API calls to test error states
-- review a site's security configuration: headers, cookie flags, CORS, TLS, exposed files and keys shipped in its JavaScript
+- inspect a site's security surface: response headers, cookie flags, CORS, TLS, exposed files, and the secrets, endpoints and library versions in its JavaScript
+- run active web checks: injection probes, open-redirect and forbidden-path tests, content discovery, HTTP-method and GraphQL-introspection checks
 
 One file, `server.py`. Every tool returns JSON.
 
@@ -94,18 +95,35 @@ Any other MCP client, as a stdio server:
 | `route` | Mock, fail or delay matching requests to test error and loading states |
 | `set_browser_headers` | Persistent headers, e.g. for a staging site behind auth |
 
-**Security review**
+**Browser identity**
 
-These check how a site is configured and report findings for disclouse.
+| Tool | What it does |
+|---|---|
+| `browser_settings` | Toggle Camoufox options: human-like cursor, ad blocking, image/WebRTC blocking, geoip |
+| `set_identity` | Give a session its own OS, locale, timezone, geolocation, viewport or a fresh fingerprint |
+
+**Security review — passive** (read what the page already loaded; send nothing)
 
 | Tool | What it checks |
 |---|---|
 | `security_headers` | CSP, HSTS, framing, nosniff, Referrer-Policy, version disclosure, cookie flags |
-| `scan_secrets` | API keys, tokens and source maps in the JavaScript a page loaded |
+| `scan_secrets` | API keys, tokens and source maps in the code a page loaded |
+| `scan_endpoints` | API endpoints named in the page's JavaScript (assignments, calls, config, observed traffic) |
+| `page_audit` | Mixed content, external scripts without SRI, JS library versions |
+
+**Security review — active** (send their own requests)
+
+| Tool | What it checks |
+|---|---|
 | `cors_check` | Which origins the CORS policy lets read responses |
-| `exposure_check` | Whether files like `.git`, `.env` or status pages are publicly reachable |
+| `exposure_check` | Whether files like `.git`, `.env` or status pages are reachable |
 | `tls_audit` | Certificate trust and expiry, protocol versions, weak ciphers |
 | `session_audit` | Whether the session ID changes at login and stops working after logout |
+| `http_methods` | Which HTTP methods a URL accepts (OPTIONS `Allow`, TRACE; writes opt-in) |
+| `content_discovery` | Request a path wordlist and report what exists, with a soft-404 baseline |
+| `forbidden_bypass` | Retry a 401/403 with header and path tricks |
+| `inject_probe` | Fuzz query parameters for SQLi, path traversal, SSTI, command injection, XSS and open redirect |
+| `graphql_introspection` | Whether a GraphQL endpoint answers an introspection query |
 
 **Networking**
 
@@ -140,4 +158,4 @@ tests/run.sh --offline   # only the ones that need no internet
 
 `run.sh` uses `.venv/bin/python` if it exists; set `PYTHON` to use another interpreter. A single test runs on its own too: `.venv/bin/python tests/forms_test.py`.
 
-`forms_test`, `audit_test`, `security_test` and `tunnel_test` run against local servers they start themselves. `smoke_test`, `qa_test`, `session_test`, `http_test`, `crash_test` and `proxy_test` need internet access.
+`forms_test`, `audit_test`, `security_test`, `offense_test` and `tunnel_test` run against local servers they start themselves, as does `scan_secrets_test.py` in the repo root. `smoke_test`, `qa_test`, `session_test`, `http_test`, `crash_test` and `proxy_test` need internet access.
